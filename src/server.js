@@ -74,6 +74,64 @@ app.get('/api/locations', authMiddleware, async (req, res) => {
   }
 });
 
+// Owner-only: create a new location (shop/branch)
+app.post('/api/locations', authMiddleware, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only the owner can create locations' });
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Location name is required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO locations (name) VALUES ($1)
+       ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+       RETURNING *`,
+      [name.trim()]
+    );
+    res.json({ location: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create location' });
+  }
+});
+
+// Owner-only: rename an existing location
+app.put('/api/locations/:id', authMiddleware, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only the owner can rename locations' });
+  const { id } = req.params;
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Location name is required' });
+  try {
+    const { rows } = await pool.query(
+      'UPDATE locations SET name = $1 WHERE id = $2 RETURNING *',
+      [name.trim(), id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Location not found' });
+    res.json({ location: rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'A location with that name already exists' });
+    console.error(err);
+    res.status(500).json({ error: 'Failed to rename location' });
+  }
+});
+
+// Owner-only: move an item to a different location (e.g. correcting a misassigned import)
+app.put('/api/items/:id/move', authMiddleware, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only the owner can move items between locations' });
+  const { id } = req.params;
+  const { toLocationId } = req.body;
+  if (!toLocationId) return res.status(400).json({ error: 'toLocationId is required' });
+  try {
+    const { rows } = await pool.query(
+      'UPDATE items SET location_id = $1, updated_at = now() WHERE id = $2 AND deleted_at IS NULL RETURNING *',
+      [toLocationId, id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Item not found' });
+    res.json({ item: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to move item' });
+  }
+});
+
 // ---------- USER MANAGEMENT (owner only) ----------
 
 app.post('/api/users', authMiddleware, async (req, res) => {
