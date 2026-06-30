@@ -1,410 +1,164 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const pool = require('./db');
-const { signToken, authMiddleware, resolveLocationId } = require('./auth');
+// M-Tech POS — API client
+// Wraps fetch calls to the backend. Every call here can fail due to no network —
+// callers (sync.js) are responsible for deciding what to do when that happens.
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const API_BASE = 'https://mtech-pos-server.onrender.com/api';
 
-// ---------- HEALTH CHECK ----------
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+function getToken() {
+  return localStorage.getItem('mtech_token');
+}
 
-// ---------- AUTH ----------
+function setToken(token) {
+  localStorage.setItem('mtech_token', token);
+}
 
-app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password required' });
+function clearToken() {
+  localStorage.removeItem('mtech_token');
+}
+
+async function apiFetch(path, options = {}) {
+  const token = getToken();
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(options.headers || {}),
+  };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
+  });
+
+  if (!res.ok) {
+    let errMsg = `Request failed (${res.status})`;
+    try {
+      const body = await res.json();
+      if (body.error) errMsg = body.error;
+    } catch (_) {}
+    const err = new Error(errMsg);
+    err.status = res.status;
+    throw err;
   }
-  try {
-    const { rows } = await pool.query(
-      'SELECT * FROM users WHERE username = $1',
-      [username.trim().toLowerCase()]
-    );
-    const user = rows[0];
-    if (!user) return res.status(401).json({ error: 'Invalid username or password' });
 
-    const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) return res.status(401).json({ error: 'Invalid username or password' });
+  return res.json();
+}
 
-    const token = signToken(user);
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        name: user.name,
-        role: user.role,
-        locationId: user.location_id,
-      },
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Login failed' });
-  }
-});
+export async function login(username, password) {
+  const data = await apiFetch('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  });
+  setToken(data.token);
+  return data.user;
+}
 
-app.get('/api/auth/me', authMiddleware, async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT id, name, role, location_id FROM users WHERE id = $1', [req.user.userId]);
-    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-    res.json({ user: { id: rows[0].id, name: rows[0].name, role: rows[0].role, locationId: rows[0].location_id } });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to fetch user' });
-  }
-});
+export function logout() {
+  clearToken();
+}
 
-// ---------- LOCATIONS ----------
+export function isLoggedIn() {
+  return !!getToken();
+}
 
-// Owner-only: list all locations (for the location switcher)
-app.get('/api/locations', authMiddleware, async (req, res) => {
-  try {
-    if (req.user.role === 'owner') {
-      const { rows } = await pool.query('SELECT * FROM locations ORDER BY name');
-      return res.json({ locations: rows });
-    }
-    const { rows } = await pool.query('SELECT * FROM locations WHERE id = $1', [req.user.locationId]);
-    res.json({ locations: rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to fetch locations' });
-  }
-});
+export async function fetchMe() {
+  const data = await apiFetch('/auth/me');
+  return data.user;
+}
 
-// Owner-only: create a new location (shop/branch)
-app.post('/api/locations', authMiddleware, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only the owner can create locations' });
-  const { name } = req.body;
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Location name is required' });
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO locations (name) VALUES ($1)
-       ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-       RETURNING *`,
-      [name.trim()]
-    );
-    res.json({ location: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to create location' });
-  }
-});
+export async function fetchLocations() {
+  const data = await apiFetch('/locations');
+  return data.locations;
+}
 
-// Owner-only: rename an existing location
-app.put('/api/locations/:id', authMiddleware, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only the owner can rename locations' });
-  const { id } = req.params;
-  const { name } = req.body;
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Location name is required' });
-  try {
-    const { rows } = await pool.query(
-      'UPDATE locations SET name = $1 WHERE id = $2 RETURNING *',
-      [name.trim(), id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Location not found' });
-    res.json({ location: rows[0] });
-  } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'A location with that name already exists' });
-    console.error(err);
-    res.status(500).json({ error: 'Failed to rename location' });
-  }
-});
+export async function fetchItems(locationId) {
+  const qs = locationId ? `?locationId=${locationId}` : '';
+  const data = await apiFetch(`/items${qs}`);
+  return data.items;
+}
 
-// Owner-only: move an item to a different location (e.g. correcting a misassigned import)
-app.put('/api/items/:id/move', authMiddleware, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only the owner can move items between locations' });
-  const { id } = req.params;
-  const { toLocationId } = req.body;
-  if (!toLocationId) return res.status(400).json({ error: 'toLocationId is required' });
-  try {
-    const { rows } = await pool.query(
-      'UPDATE items SET location_id = $1, updated_at = now() WHERE id = $2 AND deleted_at IS NULL RETURNING *',
-      [toLocationId, id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Item not found' });
-    res.json({ item: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to move item' });
-  }
-});
+export async function pushCreateItem(item, locationId) {
+  const qs = locationId ? `?locationId=${locationId}` : '';
+  const data = await apiFetch(`/items${qs}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      clientId: item.clientId,
+      name: item.name,
+      category: item.category,
+      brand: item.brand,
+      compatibility: item.compatibility,
+      costPrice: item.costPrice,
+      sellPrice: item.sellPrice,
+      qty: item.qty,
+      lowStockThreshold: item.lowStockThreshold,
+    }),
+  });
+  return data.item;
+}
 
-// ---------- USER MANAGEMENT (owner only) ----------
+export async function pushUpdateItem(serverId, changes, locationId) {
+  const qs = locationId ? `?locationId=${locationId}` : '';
+  const data = await apiFetch(`/items/${serverId}${qs}`, {
+    method: 'PUT',
+    body: JSON.stringify(changes),
+  });
+  return data.item;
+}
 
-app.post('/api/users', authMiddleware, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only the owner can create users' });
-  const { name, username, password, role, locationId } = req.body;
-  if (!name || !username || !password || !role) {
-    return res.status(400).json({ error: 'name, username, password, role are required' });
-  }
-  if (role === 'staff' && !locationId) {
-    return res.status(400).json({ error: 'Staff must be assigned a locationId' });
-  }
-  try {
-    const hash = await bcrypt.hash(password, 10);
-    const { rows } = await pool.query(
-      `INSERT INTO users (name, username, password_hash, role, location_id)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, name, username, role, location_id`,
-      [name, username.trim().toLowerCase(), hash, role, role === 'owner' ? null : locationId]
-    );
-    res.json({ user: rows[0] });
-  } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'Username already exists' });
-    console.error(err);
-    res.status(500).json({ error: 'Failed to create user' });
-  }
-});
+export async function pushDeleteItem(serverId, locationId) {
+  const qs = locationId ? `?locationId=${locationId}` : '';
+  return apiFetch(`/items/${serverId}${qs}`, { method: 'DELETE' });
+}
 
-app.get('/api/users', authMiddleware, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only the owner can view users' });
-  try {
-    const { rows } = await pool.query(
-      `SELECT u.id, u.name, u.username, u.role, u.location_id, l.name as location_name
-       FROM users u LEFT JOIN locations l ON u.location_id = l.id
-       ORDER BY u.role, u.name`
-    );
-    res.json({ users: rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to fetch users' });
-  }
-});
+export async function pushCreateSale(sale, locationId) {
+  const qs = locationId ? `?locationId=${locationId}` : '';
+  const data = await apiFetch(`/sales${qs}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      lines: sale.lines.map((l) => ({
+        itemId: l.itemServerId,
+        name: l.name,
+        qty: l.qty,
+        priceEach: l.priceEach,
+      })),
+      paymentMethod: sale.paymentMethod,
+      customerName: sale.customerName,
+      clientId: sale.clientId,
+      timestamp: new Date(sale.timestamp).toISOString(),
+    }),
+  });
+  return data.sale;
+}
 
-// ---------- ITEMS ----------
+export async function fetchSales(locationId) {
+  const qs = locationId ? `?locationId=${locationId}` : '';
+  const data = await apiFetch(`/sales${qs}`);
+  return data.sales;
+}
 
-app.get('/api/items', authMiddleware, async (req, res) => {
-  const locationId = resolveLocationId(req);
-  try {
-    let rows;
-    if (locationId) {
-      ({ rows } = await pool.query(
-        'SELECT * FROM items WHERE location_id = $1 AND deleted_at IS NULL ORDER BY name',
-        [locationId]
-      ));
-    } else {
-      // owner viewing all locations
-      ({ rows } = await pool.query(
-        `SELECT i.*, l.name as location_name FROM items i
-         JOIN locations l ON i.location_id = l.id
-         WHERE i.deleted_at IS NULL ORDER BY l.name, i.name`
-      ));
-    }
-    res.json({ items: rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to fetch items' });
-  }
-});
+export async function syncPull(locationId, since) {
+  const params = new URLSearchParams();
+  if (locationId) params.set('locationId', locationId);
+  if (since) params.set('since', since);
+  const data = await apiFetch(`/sync/pull?${params.toString()}`);
+  return data;
+}
 
-app.post('/api/items', authMiddleware, async (req, res) => {
-  const locationId = resolveLocationId(req);
-  if (!locationId) return res.status(400).json({ error: 'locationId is required' });
-  const { name, category, brand, compatibility, costPrice, sellPrice, qty, lowStockThreshold, clientId } = req.body;
-  if (!name) return res.status(400).json({ error: 'Item name is required' });
+export async function changePassword(currentPassword, newPassword) {
+  return apiFetch('/auth/change-password', {
+    method: 'POST',
+    body: JSON.stringify({ currentPassword, newPassword }),
+  });
+}
 
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO items (location_id, name, category, brand, compatibility, cost_price, sell_price, qty, low_stock_threshold, client_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       ON CONFLICT (location_id, client_id) WHERE client_id IS NOT NULL
-       DO UPDATE SET name = EXCLUDED.name, updated_at = now()
-       RETURNING *`,
-      [locationId, name, category || 'Uncategorized', brand || '', compatibility || '',
-       Number(costPrice) || 0, Number(sellPrice) || 0, Number(qty) || 0, Number(lowStockThreshold) || 3, clientId || null]
-    );
-    res.json({ item: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to create item' });
-  }
-});
+export async function fetchUsers() {
+  const data = await apiFetch('/users');
+  return data.users;
+}
 
-app.put('/api/items/:id', authMiddleware, async (req, res) => {
-  const locationId = resolveLocationId(req);
-  const { id } = req.params;
-  const { name, category, brand, compatibility, costPrice, sellPrice, qty, lowStockThreshold } = req.body;
-  try {
-    const { rows } = await pool.query(
-      `UPDATE items SET
-        name = COALESCE($1, name),
-        category = COALESCE($2, category),
-        brand = COALESCE($3, brand),
-        compatibility = COALESCE($4, compatibility),
-        cost_price = COALESCE($5, cost_price),
-        sell_price = COALESCE($6, sell_price),
-        qty = COALESCE($7, qty),
-        low_stock_threshold = COALESCE($8, low_stock_threshold),
-        updated_at = now()
-       WHERE id = $9 AND location_id = $10 AND deleted_at IS NULL
-       RETURNING *`,
-      [name, category, brand, compatibility, costPrice, sellPrice, qty, lowStockThreshold, id, locationId]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Item not found in your location' });
-    res.json({ item: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to update item' });
-  }
-});
-
-app.delete('/api/items/:id', authMiddleware, async (req, res) => {
-  const locationId = resolveLocationId(req);
-  const { id } = req.params;
-  try {
-    const { rows } = await pool.query(
-      'UPDATE items SET deleted_at = now() WHERE id = $1 AND location_id = $2 RETURNING id',
-      [id, locationId]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Item not found in your location' });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to delete item' });
-  }
-});
-
-// ---------- SALES ----------
-
-app.post('/api/sales', authMiddleware, async (req, res) => {
-  const locationId = resolveLocationId(req);
-  if (!locationId) return res.status(400).json({ error: 'locationId is required' });
-  const { lines, paymentMethod, customerName, clientId, timestamp } = req.body;
-
-  if (!lines || lines.length === 0) return res.status(400).json({ error: 'Sale must have at least one line item' });
-  if (!['cash', 'transfer'].includes(paymentMethod)) return res.status(400).json({ error: 'Invalid payment method' });
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // Idempotency: if this clientId was already synced, return the existing sale
-    if (clientId) {
-      const existing = await client.query(
-        'SELECT * FROM sales WHERE location_id = $1 AND client_id = $2',
-        [locationId, clientId]
-      );
-      if (existing.rows[0]) {
-        await client.query('ROLLBACK');
-        const linesRes = await pool.query('SELECT * FROM sale_lines WHERE sale_id = $1', [existing.rows[0].id]);
-        return res.json({ sale: { ...existing.rows[0], lines: linesRes.rows }, alreadyExisted: true });
-      }
-    }
-
-    // Validate stock for every line, lock rows to prevent race conditions across devices
-    for (const line of lines) {
-      const itemRes = await client.query(
-        'SELECT * FROM items WHERE id = $1 AND location_id = $2 FOR UPDATE',
-        [line.itemId, locationId]
-      );
-      const item = itemRes.rows[0];
-      if (!item) throw new Error(`Item not found: ${line.name || line.itemId}`);
-      if (item.qty < line.qty) throw new Error(`Not enough stock for ${item.name}. Available: ${item.qty}`);
-    }
-
-    const total = lines.reduce((sum, l) => sum + l.qty * l.priceEach, 0);
-
-    const saleRes = await client.query(
-      `INSERT INTO sales (location_id, user_id, customer_name, payment_method, total, client_id, timestamp)
-       VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7, now()))
-       RETURNING *`,
-      [locationId, req.user.userId, customerName || '', paymentMethod, total, clientId || null, timestamp || null]
-    );
-    const sale = saleRes.rows[0];
-
-    const savedLines = [];
-    for (const line of lines) {
-      const lineRes = await client.query(
-        `INSERT INTO sale_lines (sale_id, item_id, name, qty, price_each)
-         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-        [sale.id, line.itemId, line.name, line.qty, line.priceEach]
-      );
-      savedLines.push(lineRes.rows[0]);
-
-      await client.query('UPDATE items SET qty = qty - $1, updated_at = now() WHERE id = $2', [line.qty, line.itemId]);
-      await client.query(
-        `INSERT INTO stock_adjustments (location_id, item_id, qty_change, reason, ref_id, user_id)
-         VALUES ($1,$2,$3,'sale',$4,$5)`,
-        [locationId, line.itemId, -line.qty, sale.id, req.user.userId]
-      );
-    }
-
-    await client.query('COMMIT');
-    res.json({ sale: { ...sale, lines: savedLines } });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-app.get('/api/sales', authMiddleware, async (req, res) => {
-  const locationId = resolveLocationId(req);
-  try {
-    let salesRows;
-    if (locationId) {
-      ({ rows: salesRows } = await pool.query(
-        'SELECT * FROM sales WHERE location_id = $1 ORDER BY timestamp DESC LIMIT 500',
-        [locationId]
-      ));
-    } else {
-      ({ rows: salesRows } = await pool.query(
-        `SELECT s.*, l.name as location_name FROM sales s
-         JOIN locations l ON s.location_id = l.id
-         ORDER BY s.timestamp DESC LIMIT 500`
-      ));
-    }
-    const saleIds = salesRows.map((s) => s.id);
-    let lineRows = [];
-    if (saleIds.length) {
-      const { rows } = await pool.query('SELECT * FROM sale_lines WHERE sale_id = ANY($1)', [saleIds]);
-      lineRows = rows;
-    }
-    const sales = salesRows.map((s) => ({ ...s, lines: lineRows.filter((l) => l.sale_id === s.id) }));
-    res.json({ sales });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to fetch sales' });
-  }
-});
-
-// ---------- SYNC: PULL CHANGES SINCE TIMESTAMP ----------
-// Devices call this on reconnect to pull anything changed elsewhere since their last sync.
-
-app.get('/api/sync/pull', authMiddleware, async (req, res) => {
-  const locationId = resolveLocationId(req);
-  if (!locationId) return res.status(400).json({ error: 'locationId is required' });
-  const since = req.query.since ? new Date(Number(req.query.since)) : new Date(0);
-
-  try {
-    const { rows: items } = await pool.query(
-      'SELECT * FROM items WHERE location_id = $1 AND updated_at > $2',
-      [locationId, since]
-    );
-    const { rows: sales } = await pool.query(
-      'SELECT * FROM sales WHERE location_id = $1 AND created_at > $2 ORDER BY timestamp DESC',
-      [locationId, since]
-    );
-    const saleIds = sales.map((s) => s.id);
-    let lines = [];
-    if (saleIds.length) {
-      const { rows } = await pool.query('SELECT * FROM sale_lines WHERE sale_id = ANY($1)', [saleIds]);
-      lines = rows;
-    }
-    res.json({
-      serverTime: Date.now(),
-      items,
-      sales: sales.map((s) => ({ ...s, lines: lines.filter((l) => l.sale_id === s.id) })),
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Sync pull failed' });
-  }
-});
-
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`M-Tech POS server running on port ${PORT}`));
+export async function createStaffUser({ name, username, password, locationId }) {
+  const data = await apiFetch('/users', {
+    method: 'POST',
+    body: JSON.stringify({ name, username, password, role: 'staff', locationId }),
+  });
+  return data.user;
+}
